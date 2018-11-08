@@ -39,7 +39,7 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>./glog-0.3.5/src/windows;$(IncludePath)</IncludePath>
+    <IncludePath>./glog-0.3.5/src/windows;$(FrameworkSDKDir)\include;$(WindowsSdkDir)include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>
@@ -79,6 +79,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="COnvifIocp.h" />
+    <ClInclude Include="onvifiocpset.h" />
     <ClInclude Include="OnvifObj.h" />
   </ItemGroup>
   <ItemGroup>

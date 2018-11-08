@@ -2,7 +2,6 @@
 /* 实现windows iocp框架                                                                    */
 /************************************************************************/
 #pragma once
-#include <Windows.h>
 #include "glog/logging.h"
 #include "OnvifObj.h"
 #include <process.h>
@@ -10,6 +9,10 @@
 #include <atlstr.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
+#include <process.h>
+#include "onvifiocpset.h"
+
+
 
 #define LOG_ERROR LOG(INFO)
 #define LOG_TRACE LOG(INFO)
@@ -50,24 +53,36 @@ typedef enum
 	EONVIFIOCP_BUFFER_STATE_CLOSE	= 5,	// Close
 } EOnvifBufferObjState;
 
+/*
+	动作回调返回值定义
+*/
+#define Action_Continue (int)(1)
+
+
+
 //只支持ipv4，后续需要ipv6的再改造
-struct Onvifiocp_Sockaddr
+typedef struct Onvifiocp_Sockaddr
 {
 	union
 	{
 		ADDRESS_FAMILY	family;
 		SOCKADDR		addr;
 		SOCKADDR_IN		addr4;
+		SOCKADDR_IN6	addr6;
 	};
 
 	inline BOOL IsIPv4()			const	{return family == AF_INET;}
 	inline USHORT Port()			const	{return ntohs(addr4.sin_port);}
-	Onvifiocp_Sockaddr& operator =(const Onvifiocp_Sockaddr& addr)
+
+	inline Onvifiocp_Sockaddr& operator =(const Onvifiocp_Sockaddr& cpyaddr)
 	{
-		memcpy( this, &addr,sizeof(SOCKADDR_IN));
+		if(this != &cpyaddr)
+		{
+			memcpy(this, &cpyaddr,sizeof(SOCKADDR_IN));
+		}
 		return *this;
 	}
-};
+}OnvifiocpSockaddr,*OnvifiocppSockaddr;
 
 
 typedef ULONG_PTR	CONNID;
@@ -88,31 +103,38 @@ private:
     const DWORD m_dwTaskNum;
 	const DWORD m_dwMaxConnect;
 	CPrivateHeapImpl m_PrivHeap;
-	CNotifyManager *pNotify;
+	CNotifyManager *m_pNotify;
     std::vector<HANDLE>	m_vtTaskThreads;
 	
 
 
 public:
+	HANDLE GetComPort()
+	{
+		return m_hCompPort;
+	}
+
 	COnvifIocp(BOOL isServer,const DWORD dwTaskNum,CNotifyManager *pNotify):
 	    m_bIsServer(isServer),m_hCompPort(nullptr),
 		m_eState(EONVIFIOCPSTATE_BIRTH),
         m_dwTaskNum(dwTaskNum),
 		m_dwMaxConnect(ONVIFIOCP_DEFAULT_CONNECT_MAX),
-		pNotify(pNotify)
+		m_pNotify(pNotify)
 	{
 		m_pfnAcceptEx = nullptr;
 		m_pfnGetAcceptExSockaddrs  = nullptr;
 	}
 
-	int COnvifIocp::ManualCloseSocket(SOCKET sock, int iShutdownFlag = 0xFF, BOOL bGraceful=TRUE, BOOL bReuseAddress=FALSE);
-    BOOL COnvifIocp::CreateTaskThreads();
-	UINT __stdcall COnvifIocp::TaskProc(LPVOID pv);
-    EOnvifIocpError COnvifIocp::Start();
-    virtual BOOL COnvifIocp::ServerPostAccept();
+	SOCKET  CreateSocket(TParCreateSocket& ScoketPar);
+	int ManualCloseSocket(SOCKET sock, int iShutdownFlag = 0xFF, BOOL bGraceful=TRUE, BOOL bReuseAddress=FALSE);
+    BOOL CreateTaskThreads();
+	static unsigned int __stdcall TaskProc(LPVOID pv);
+    EOnvifIocpError Start();
+	void CloseConnectSocket(TSocketObj *pSocktObj);
+	void AddToInactiveSocketObj(TSocketObj *pSocktObj);
 
 public:
-	BOOL COnvifIocp::EventPostAccept(SOCKET hListenFd,ULONG_PTR pBackObj,DWORD dwAcceptNum=ONVIFIOCP_DEFAULT_ACCEPT_NUM);
+	BOOL EventPostAccept(SOCKET hListenFd,ULONG_PTR pBackObj,DWORD dwAcceptNum=ONVIFIOCP_DEFAULT_ACCEPT_NUM);
 	
 
 private:
@@ -132,7 +154,7 @@ private:
 
 	BOOL COnvifIocp::ActionPostAccept(SOCKET hListenFd);
 	void COnvifIocp::DoAcceptState(TBufferObj *pBufferObj,TSocketObj *pSocketObj);
-	BOOL COnvifIocp::ActionPostRecv(TBufferObj *pBufferObj,TSocketObj *pSocketObj);
+	int COnvifIocp::ActionPostRecv(TBufferObj *pBufferObj,TSocketObj *pSocketObj,BOOL bPost);
 	void COnvifIocp::DoRecvState(TBufferObj *pBufferObj,TSocketObj *pSocketObj);
 
 	BOOL InitCpmpletePort()
@@ -144,7 +166,7 @@ private:
 
 	    if(m_hCompPort == nullptr)
 		{
-			LOG_DEBUG << __FUNCTION__ << ::GetLastError();
+			LOG_DEBUG << " InitCpmpletePort error" << __FUNCTION__ << ::GetLastError();
 		}
 
 		return (m_hCompPort != nullptr);
@@ -155,6 +177,7 @@ private:
 	//buffer相关成员
 	CNodePoolT<TBufferObj> m_BufferObjPool;
 	CRingCache2<TSocketObj, CONNID, true> m_bfActiveSocktObj;
+    CRingPool<TSocketObj> m_bfInactiveSocktObj;
 
 
 	TSocketObj*	COnvifIocp::GetNewSocketObj(CONNID dwConnID, SOCKET soClient);
@@ -170,17 +193,44 @@ class CNotifyManager
 {
 public:
 	typedef enum{
+		ENOTIFY_ACTIOON_RECV,
+		ENOTIFY_ACTION_CLOSE
+	}EActionType;
+
+	typedef enum{
 		ENOTIFY_ACCEPT_OK=0,
 		ENOTIFY_ACCEPT_FAIL,
 		ENOTIFY_PREPARE_ACCEPT_NEW_CONNECT,
 
 		ENOTIFY_PREPARE_RECV,
-		ENOTIFY_PREPARE_RECVED,
+		ENOTIFY_RECVED,
 
 		ENOTIFY_ERROR_MSG,
 		ENOTIFY_ERROR_UNKNOW
 	}ENotifyType; 
+
+
+	int ActionSwitch(EActionType eAction,COnvifIocp *pApi,BYTE *pBuffer,DWORD dwLen)
+	{
+		switch(eAction)
+		{
+			case ENOTIFY_ACTIOON_RECV:
+				doActionRecv(pApi,pBuffer,dwLen);
+				break;
+
+			case ENOTIFY_ACTION_CLOSE:
+				doActionBeforeClose(pApi,pBuffer,dwLen);
+				break;
+
+
+			default:
+				break;
+		}
+		return 0;
+	}
+
 private:
+
 	void NotifySwitch(ENotifyType eNotify,char *pMsg)
 	{
 		if(eNotify >= ENOTIFY_ACCEPT_OK && eNotify <= ENOTIFY_ERROR_UNKNOW)
@@ -210,16 +260,26 @@ private:
 				doNotifyPrepareRecv(pMsg);
 				break;
 
+			case ENOTIFY_RECVED:
+				doNotifyRecved(pMsg);
+			default:
+				break;
+
 		}
 	}
 
 public:
+	//notify
 	void Publisher(ENotifyType eType,char* pchrMsg){return NotifySwitch(eType,pchrMsg);}
-	virtual void doNotifyAcceptOk(char *pMsg) {LOG_ERROR<<"Publish NotifyAcceptOk"<< pMsg;return;}
-	virtual void doNotifyAcceptFail(char *pMsg){LOG_ERROR<<"Publish NotifyAcceptFail"<< pMsg;return;}
-	virtual void doNotifyPrepareRecv(char *pMsg){LOG_ERROR<<"Publish NotifyAcceptFail"<< pMsg;return;}
-	virtual void doNotifyPrepareAcceptNewConnect(char *pMsg){LOG_ERROR<<"Publish NotifyAcceptFail"<< pMsg;return;}
+	virtual void doNotifyAcceptOk(char *pMsg) {LOG_ERROR<<" Publish NotifyAcceptOk"<< pMsg;return;}
+	virtual void doNotifyAcceptFail(char *pMsg){LOG_ERROR<<" Publish NotifyAcceptFail"<< pMsg;return;}
+	virtual void doNotifyPrepareRecv(char *pMsg){LOG_ERROR<<" Publish PrepareRecv"<< pMsg;return;}
+	virtual void doNotifyPrepareAcceptNewConnect(char *pMsg){LOG_ERROR<<" Publish Prepare Accept a New Connect"<< pMsg;return;}
+	virtual void doNotifyRecved(char *pMsg){LOG_ERROR<<" Publish Prepare Recved:"<< pMsg;return;}
 
+	//action 
+	virtual void doActionRecv(COnvifIocp *pApi,BYTE *pBuffer,DWORD dwLen) {LOG_ERROR<<"doActionRecv " << dwLen <<" bytes -->" << pBuffer;return;}
+	virtual void doActionBeforeClose(COnvifIocp *pApi,BYTE *pBuffer,DWORD dwLen) {LOG_ERROR<<"doActionRecv";return;}
 };
 
 
@@ -277,7 +337,7 @@ struct TSocketObj : public TSocketObjBase
 {
 	SOCKET		socket;
 	CONNID		connID;
-	Onvifiocp_Sockaddr	remoteAddr;
+	OnvifiocpSockaddr	remoteAddr;
 
 	ATL::CStringA	host;
 	TBufferObjListT<TBufferObj>	m_BuffList;
@@ -325,6 +385,7 @@ struct TBufferObj : public TBufferObjBase<TBufferObj>
 {
 	static SOCKET hlistenFd;
 	SOCKET hClientFd;
+	DWORD dwRecvLen;
 	EOnvifBufferObjState eState;//这里存储EOnvifBufferObjState
 
 	BOOL ListenFdIsSet(){return hlistenFd != 0;}

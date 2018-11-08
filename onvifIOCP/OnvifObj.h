@@ -1,15 +1,219 @@
 #pragma once
-#include <Windows.h>
+//#include <Windows.h>
+#include <WinSock2.h>
+#include <ws2def.h> 
+#include <ws2ipdef.h>
+#include <mswsock.h>
 #include <atlstr.h>
 #include <unordered_set>
 #include <assert.h>
-#include <unique_ptr>
+
+
+
+
+
+#pragma comment( lib,"winmm.lib" )
+//#include <uniqu//e_ptr>
+
+
+#define ASSERT assert
+
+//重入自旋锁实现，考虑到onvif业务会多线程调用，和iocp里多线程对事件的处理
+//那么在一个线程里要保证网络数据的连贯性，不至于被多线程弄乱。
+#pragma intrinsic(_ReadBarrier)
+#pragma intrinsic(_WriteBarrier)
+#pragma intrinsic(_ReadWriteBarrier)
+
+//为了避免线程调度的消耗，这个值可以假定为一次线程调度的消耗。
+#define DEFAULT_CRISEC_SPIN_COUNT	4096
+
+#if defined (_WIN64)
+#define DEFAULT_PAUSE_RETRY		16
+#define DEFAULT_PAUSE_YIELD		128
+#define DEFAULT_PAUSE_CYCLE		8192
+#else
+#define DEFAULT_PAUSE_RETRY		4
+#define DEFAULT_PAUSE_YIELD		32
+#define DEFAULT_PAUSE_CYCLE		4096
+#endif
+
+#ifndef YieldProcessor
+#pragma intrinsic(_mm_pause)
+#define YieldProcessor _mm_pause
+#endif
+
+//放弃资源，注意在SwitchToThread()时就已经发生线程切换了(性能损耗)。
+static inline void YieldThread(UINT i = DEFAULT_PAUSE_RETRY)
+{
+	//在xp以后的系统中Sleep(0) 和SwitchToThread（）是一样的作用
+	if		(i < DEFAULT_PAUSE_RETRY)		;
+	else if	(i < DEFAULT_PAUSE_YIELD)		YieldProcessor();/*让其他线程在此cpu上执行*/
+	else if	(i < DEFAULT_PAUSE_CYCLE - 1)	SwitchToThread();
+	else if	(i < DEFAULT_PAUSE_CYCLE)		Sleep(0);
+	else									YieldThread(i & (DEFAULT_PAUSE_CYCLE - 1));
+}
+
+//在单一线程中，这个锁允许重入，性能非常高（使用原子指令）
+class CReentrantSpinGuard
+{
+public:
+	CReentrantSpinGuard()
+		: m_dwThreadID	(0)
+		, m_iCount		(0)
+	{
+
+	}
+
+	~CReentrantSpinGuard()
+	{
+		ASSERT(m_dwThreadID	== 0);
+		ASSERT(m_iCount		== 0);
+	}
+
+	void Lock()
+	{
+		for(UINT i = 0; !_TryLock(i == 0); ++i)
+			YieldThread(i);
+	}
+
+	BOOL TryLock()
+	{
+		return _TryLock(TRUE);
+	}
+
+	void Unlock()
+	{
+		ASSERT(m_dwThreadID == ::GetCurrentThreadId());
+
+		if((--m_iCount) == 0)
+			m_dwThreadID = 0;
+	}
+
+private:
+	CReentrantSpinGuard(const CReentrantSpinGuard& cs);
+	CReentrantSpinGuard operator = (const CReentrantSpinGuard& cs);
+
+	BOOL _TryLock(BOOL bFirst)
+	{
+		DWORD dwCurrentThreadID = ::GetCurrentThreadId();
+
+		if(bFirst && m_dwThreadID == dwCurrentThreadID)
+		{
+			++m_iCount;
+			return TRUE;
+		}
+
+		if(::InterlockedCompareExchange(&m_dwThreadID, dwCurrentThreadID, 0) == 0)
+		{
+			::_ReadWriteBarrier();
+			ASSERT(m_iCount == 0);
+
+			m_iCount = 1;
+
+			return TRUE;
+		}
+
+		return FALSE;
+	}
+
+private:
+	volatile DWORD	m_dwThreadID;
+	int				m_iCount;
+};
+
+//对系统自旋临界区的封装，上层看上去就和一个锁一样。
+class CInterCriSec
+{
+public:
+	CInterCriSec(DWORD dwSpinCount = DEFAULT_CRISEC_SPIN_COUNT)
+	{
+		int nRet = ::InitializeCriticalSectionAndSpinCount(&m_crisec, dwSpinCount);
+		ASSERT(nRet != 0);
+	}
+
+	~CInterCriSec()
+	{::DeleteCriticalSection(&m_crisec);}
+
+	void Lock()								{::EnterCriticalSection(&m_crisec);}
+	void Unlock()							{::LeaveCriticalSection(&m_crisec);}
+	BOOL TryLock()							{return ::TryEnterCriticalSection(&m_crisec);}
+	DWORD SetSpinCount(DWORD dwSpinCount)	{return ::SetCriticalSectionSpinCount(&m_crisec, dwSpinCount);}
+
+	CRITICAL_SECTION* GetObject()			{return &m_crisec;}
+
+private:
+	CInterCriSec(const CInterCriSec& cs);
+	CInterCriSec operator = (const CInterCriSec& cs);
+
+private:
+	CRITICAL_SECTION m_crisec;
+};
+
+//
+//锁使用help
+template<class CLockObj> class CLocalLock
+{
+public:
+	CLocalLock(CLockObj& obj) : m_lock(obj) {m_lock.Lock();}
+	~CLocalLock() {m_lock.Unlock();}
+private:
+	CLockObj& m_lock;
+};
+
+//对SRWLock的封装
+class CRWLock
+{
+public:
+	CRWLock()
+	{
+		::InitializeSRWLock(&m_Lock);
+	}
+
+	void WriteLock()
+	{
+		::AcquireSRWLockExclusive(&m_Lock);
+	}
+
+	void WritLockRelease()
+	{
+		::ReleaseSRWLockExclusive(&m_Lock);
+	}
+	void ReadLock()
+	{
+		::AcquireSRWLockShared(&m_Lock);
+	}
+
+	void ReadLockRelease()
+	{
+		::ReleaseSRWLockShared(&m_Lock);
+	}
+
+	BOOL TryReadLock()	
+	{
+		return ::TryAcquireSRWLockShared(&m_Lock);
+	}
+
+	BOOL TryWritLoc()	
+	{
+		return ::TryAcquireSRWLockExclusive(&m_Lock);
+	}
+	//禁止copy
+private:
+	CRWLock(const CRWLock&);
+	CRWLock operator = (const CRWLock&);
+
+private:
+	SRWLOCK m_Lock;
+};
+
+
 
 
 /************************************************************************/
 /* 为了提高性能使用私有堆来实现buffer                                                                     */
 /************************************************************************/
 class CReentrantSpinGuard;
+class CInterCriSec;
 template<class CLockObj> class CLocalLock;
 template<class T> struct TSimpleList;
 
@@ -69,14 +273,14 @@ template<class T> struct TBufferObjBase
 	WSABUF				buff;
 
 	int					capacity;
-	CPrivateHeap&		heap;
+	CPrivateHeapImpl&		heap;
 
 	volatile LONG		sndCounter;
 
 	T* next;
 	T* last;
 
-	static T* Construct(CPrivateHeap& heap, DWORD dwCapacity)
+	static T* Construct(CPrivateHeapImpl& heap, DWORD dwCapacity)
 	{
 		T* pBufferObj = (T*)heap.Alloc(sizeof(T) + dwCapacity);
 		ASSERT(pBufferObj);
@@ -105,7 +309,7 @@ template<class T> struct TBufferObjBase
 		return ::InterlockedDecrement(&sndCounter);
 	}
 
-	TBufferObjBase(CPrivateHeap& hp, DWORD dwCapacity)
+	TBufferObjBase(CPrivateHeapImpl& hp, DWORD dwCapacity)
 		: heap(hp), capacity((int)dwCapacity)
 	{
 		ASSERT(capacity > 0);
@@ -131,7 +335,10 @@ template<class T> struct TBufferObjBase
 	BOOL IsFull()	{return Remain() == 0;}
 };
 
-//无锁环来控制临界区
+#define CACHE_LINE		64
+#define PACK_SIZE_OF(T)	(CACHE_LINE - sizeof(T) % CACHE_LINE)
+
+//无锁环
 template <class T> class CRingPool
 {
 private:
@@ -393,11 +600,8 @@ template <class T> T* const CRingPool<T>::E_RELEASED	= (T*)0x02;
 template <class T> T* const CRingPool<T>::E_OCCUPIED	= (T*)0x03;
 template <class T> T* const CRingPool<T>::E_MAX_STATUS	= (T*)0x0F;
 
-//提供给iocp框架的buffer管理类。使用无锁环来实现高性能
-template<class T> const DWORD CNodePoolT<T>::DEFAULT_ITEM_CAPACITY	= ::SysGetPageSize();
-template<class T> const DWORD CNodePoolT<T>::DEFAULT_POOL_SIZE		= 300;
-template<class T> const DWORD CNodePoolT<T>::DEFAULT_POOL_HOLD		= 1200;
 
+//buffer 容器。
 template<class T> class CNodePoolT
 {
 public:
@@ -409,6 +613,8 @@ public:
 			T::Destruct(pItem);
 	}
 
+	//注意这里使用的是一个链表，来表示缓冲buffer，当释放缓冲区
+	//使用默认构造，相当于不使用缓冲。
 	void PutFreeItem(TSimpleList<T>& lsItem)
 	{
 		if(lsItem.IsEmpty())
@@ -442,7 +648,7 @@ public:
 		while(m_lsFreeItem.TryGet(&pItem))
 			T::Destruct(pItem);
 
-		VERIFY(m_lsFreeItem.IsEmpty());
+		ASSERT(m_lsFreeItem.IsEmpty() == TRUE);
 		m_lsFreeItem.Reset();
 
 		m_heap.Reset();
@@ -457,6 +663,7 @@ public:
 	DWORD GetPoolHold		()					{return m_dwPoolHold;}
 
 public:
+	//不使用释放缓冲，onvif业务量不是很大，私有堆的性能一般吧能满足。
 	CNodePoolT(	DWORD dwPoolSize	 = DEFAULT_POOL_SIZE,
 		DWORD dwPoolHold	 = DEFAULT_POOL_HOLD,
 		DWORD dwItemCapacity = DEFAULT_ITEM_CAPACITY)
@@ -467,8 +674,6 @@ public:
 	}
 
 	~CNodePoolT()	{Clear();}
-
-	DECLARE_NO_COPY_CLASS(CNodePoolT)
 
 public:
 	static const DWORD DEFAULT_ITEM_CAPACITY;
@@ -481,9 +686,30 @@ private:
 	DWORD			m_dwItemCapacity;
 	DWORD			m_dwPoolSize;
 	DWORD			m_dwPoolHold;
-
+	
+	//释放缓冲
 	CRingPool<T>	m_lsFreeItem;
 };
+
+//提供给iocp框架的buffer管理类。使用无锁环来实现高性能
+static VOID SysGetSystemInfo(LPSYSTEM_INFO pInfo)
+{
+	ASSERT(pInfo != nullptr);
+	::GetNativeSystemInfo(pInfo);
+}
+
+static DWORD SysGetPageSize()
+{
+	SYSTEM_INFO si;
+	SysGetSystemInfo(&si);
+
+	return si.dwPageSize;
+}
+
+template<class T> const DWORD CNodePoolT<T>::DEFAULT_ITEM_CAPACITY	= SysGetPageSize();
+template<class T> const DWORD CNodePoolT<T>::DEFAULT_POOL_SIZE		= 300;
+template<class T> const DWORD CNodePoolT<T>::DEFAULT_POOL_HOLD		= 1200;
+
 
 //接收和发送buffer基类模板
 template<class T> struct TSimpleList
@@ -623,7 +849,6 @@ public:
 	TSimpleList()	{Reset();}
 	~TSimpleList()	{Clear();}
 
-	DECLARE_NO_COPY_CLASS(TSimpleList<T>)
 
 private:
 	void Reset()
@@ -639,7 +864,7 @@ private:
 	T*	pBack;
 };
 
-/* Socket 缓冲区基础结构 */
+// Socket 缓冲区基础结构 
 struct TSocketObjBase
 {
 	static const long DEF_SNDBUFF_SIZE = 8192;
@@ -659,7 +884,7 @@ struct TSocketObjBase
 
 	DWORD		activeTime;
 
-	CCriSec		csSend;
+	CInterCriSec	csSend;
 
 	long			sndBuffSize;
 	volatile BOOL	smooth;
@@ -681,7 +906,7 @@ struct TSocketObjBase
 	{ASSERT(IsExist(pSocketObj)); pSocketObj->valid = FALSE;}
 
 	static void Release(TSocketObjBase* pSocketObj)
-	{ASSERT(IsExist(pSocketObj)); pSocketObj->freeTime = ::TimeGetTime();}
+	{ASSERT(IsExist(pSocketObj)); pSocketObj->freeTime = ::timeGetTime();}
 
 	long Pending()		{return pending;}
 	BOOL IsPending()	{return pending > 0;}
@@ -724,7 +949,7 @@ struct TSocketObjBase
 	}
 };
 
-//用于 SocketObj 缓存
+//准备用于 SocketObj 缓存，但不限于此
 template <class T, class index_type = DWORD, bool adjust_index = false> class CRingCache2
 {
 public:
@@ -734,7 +959,7 @@ public:
 	typedef T*									TPTR;
 	typedef volatile T*							VTPTR;
 
-	typedef unordered_set<index_type>			IndexSet;
+	typedef std::unordered_set<index_type>			IndexSet;
 	typedef typename IndexSet::const_iterator	IndexSetCI;
 	typedef typename IndexSet::iterator			IndexSetI;
 
@@ -949,7 +1174,7 @@ public:
 		return isOK;
 	}
 
-	unique_ptr<index_type[]> GetAllElementIndexes(DWORD& dwCount, BOOL bCopy = TRUE)
+	std::unique_ptr<index_type[]> GetAllElementIndexes(DWORD& dwCount, BOOL bCopy = TRUE)
 	{
 		IndexSet* pIndexes = nullptr;
 		IndexSet indexes;
@@ -959,7 +1184,7 @@ public:
 		else
 			pIndexes = &m_indexes;
 
-		unique_ptr<index_type[]> ids;
+		std::unique_ptr<index_type[]> ids;
 		dwCount = (DWORD)pIndexes->size();
 
 		if(dwCount > 0)
@@ -1019,8 +1244,9 @@ private:
 	IndexSet& CopyIndexes(IndexSet& indexes)
 	{
 		{
-			CReadLock locallock(m_cs);
+			m_cs.ReadLock();
 			indexes = m_indexes;
+			m_cs.ReadLockRelease();
 		}
 
 		return indexes;
@@ -1028,14 +1254,16 @@ private:
 
 	void EmplaceIndex(index_type dwIndex)
 	{
-		CWriteLock locallock(m_cs);
+		m_cs.WriteLock();
 		m_indexes.emplace(dwIndex);
+		m_cs.WritLockRelease();
 	}
 
 	void EraseIndex(index_type dwIndex)
 	{
-		CWriteLock locallock(m_cs);
+		m_cs.WriteLock();
 		m_indexes.erase(dwIndex);
+		m_cs.WritLockRelease();
 	}
 
 public:
@@ -1069,128 +1297,19 @@ private:
 	volatile DWORD		m_dwCount;
 	char				pack4[PACK_SIZE_OF(DWORD)];
 
-	CSimpleRWLock		m_cs;
+	CRWLock		m_cs;
 	IndexSet			m_indexes;
 };
+
+#if !defined(_WIN64)
+#define  CRingCache2Max 0x00FFFFFF
+#else
+#define  CRingCache2Max 0xFFFFFFFF
+#endif
 
 template <class T, class index_type, bool adjust_index> T* const CRingCache2<T, index_type, adjust_index>::E_EMPTY		= (T*)0x00;
 template <class T, class index_type, bool adjust_index> T* const CRingCache2<T, index_type, adjust_index>::E_LOCKED		= (T*)0x01;
 template <class T, class index_type, bool adjust_index> T* const CRingCache2<T, index_type, adjust_index>::E_MAX_STATUS	= (T*)0x0F;
+template <class T, class index_type, bool adjust_index> DWORD const CRingCache2<T, index_type, adjust_index>::MAX_SIZE	= CRingCache2Max;
 
-//重入自旋锁实现，考虑到onvif业务会多线程调用，和iocp里多线程对事件的处理
-//那么在一个线程里要保证网络数据的连贯性，不至于被多线程弄乱。
-#pragma intrinsic(_ReadBarrier)
-#pragma intrinsic(_WriteBarrier)
-#pragma intrinsic(_ReadWriteBarrier)
 
-#define DEFAULT_CRISEC_SPIN_COUNT	4096
-
-#if defined (_WIN64)
-#define DEFAULT_PAUSE_RETRY		16
-#define DEFAULT_PAUSE_YIELD		128
-#define DEFAULT_PAUSE_CYCLE		8192
-#else
-#define DEFAULT_PAUSE_RETRY		4
-#define DEFAULT_PAUSE_YIELD		32
-#define DEFAULT_PAUSE_CYCLE		4096
-#endif
-
-#ifndef YieldProcessor
-#pragma intrinsic(_mm_pause)
-#define YieldProcessor _mm_pause
-#endif
-
-static inline void YieldThread(UINT i = DEFAULT_PAUSE_RETRY)
-{
-	if		(i < DEFAULT_PAUSE_RETRY)		;
-	else if	(i < DEFAULT_PAUSE_YIELD)		YieldProcessor();
-	else if	(i < DEFAULT_PAUSE_CYCLE - 1)	SwitchToThread();
-	else if	(i < DEFAULT_PAUSE_CYCLE)		Sleep(0);
-	else									YieldThread(i & (DEFAULT_PAUSE_CYCLE - 1));
-}
-
-static inline void YieldThread(UINT i = DEFAULT_PAUSE_RETRY)
-{
-	if		(i < DEFAULT_PAUSE_RETRY)		;
-	else if	(i < DEFAULT_PAUSE_YIELD)		YieldProcessor();
-	else if	(i < DEFAULT_PAUSE_CYCLE - 1)	SwitchToThread();
-	else if	(i < DEFAULT_PAUSE_CYCLE)		Sleep(0);
-	else									YieldThread(i & (DEFAULT_PAUSE_CYCLE - 1));
-}
-
-class CReentrantSpinGuard
-{
-public:
-	CReentrantSpinGuard()
-		: m_dwThreadID	(0)
-		, m_iCount		(0)
-	{
-
-	}
-
-	~CReentrantSpinGuard()
-	{
-		ASSERT(m_dwThreadID	== 0);
-		ASSERT(m_iCount		== 0);
-	}
-
-	void Lock()
-	{
-		for(UINT i = 0; !_TryLock(i == 0); ++i)
-			YieldThread(i);
-	}
-
-	BOOL TryLock()
-	{
-		return _TryLock(TRUE);
-	}
-
-	void Unlock()
-	{
-		ASSERT(m_dwThreadID == ::GetCurrentThreadId());
-
-		if((--m_iCount) == 0)
-			m_dwThreadID = 0;
-	}
-
-private:
-	CReentrantSpinGuard(const CReentrantSpinGuard& cs);
-	CReentrantSpinGuard operator = (const CReentrantSpinGuard& cs);
-
-	BOOL _TryLock(BOOL bFirst)
-	{
-		DWORD dwCurrentThreadID = ::GetCurrentThreadId();
-
-		if(bFirst && m_dwThreadID == dwCurrentThreadID)
-		{
-			++m_iCount;
-			return TRUE;
-		}
-
-		if(::InterlockedCompareExchange(&m_dwThreadID, dwCurrentThreadID, 0) == 0)
-		{
-			::_ReadWriteBarrier();
-			ASSERT(m_iCount == 0);
-
-			m_iCount = 1;
-
-			return TRUE;
-		}
-
-		return FALSE;
-	}
-
-private:
-	volatile DWORD	m_dwThreadID;
-	int				m_iCount;
-};
-
-//锁使用help
-template<class CLockObj> class CLocalLock
-{
-public:
-	CLocalLock(CLockObj& obj) : m_lock(obj) {m_lock.Lock();}
-	~CLocalLock() {m_lock.Unlock();}
-private:
-	CLockObj& m_lock;
-};
