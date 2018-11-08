@@ -266,7 +266,7 @@ private:
 	SIZE_T	m_dwMaxSize;
 };
 
-//buffer 基类
+//buffer 基类目前定为一页大小，后续优化成可以自适应
 template<class T> struct TBufferObjBase
 {
 	WSAOVERLAPPED		ov;
@@ -315,19 +315,19 @@ template<class T> struct TBufferObjBase
 		ASSERT(capacity > 0);
 	}
 
-	int Cat(const BYTE* pData, int length)
+	int Join(const BYTE* pData, int length)
 	{
 		ASSERT(pData != nullptr && length > 0);
 
-		int cat = min(Remain(), length);
+		int nRet = min(Remain(), length);
 
-		if(cat > 0)
+		if(nRet > 0)
 		{
-			memcpy(buff.buf + buff.len, pData, cat);
-			buff.len += cat;
+			memcpy(buff.buf + buff.len, pData, nRet);
+			buff.len += nRet;
 		}
 
-		return cat;
+		return nRet;
 	}
 
 	void Reset()	{buff.len = 0;}
@@ -887,12 +887,12 @@ struct TSocketObjBase
 	CInterCriSec	csSend;
 
 	long			sndBuffSize;
-	volatile BOOL	smooth;
+
+	/*使用block来控制发送*/
+	volatile BOOL	block;
+
 	volatile long	pending;
 	volatile long	sndCount;
-
-	volatile BOOL	paused;
-	volatile BOOL	recving;
 
 	CReentrantSpinGuard csRecv;
 
@@ -911,11 +911,11 @@ struct TSocketObjBase
 	long Pending()		{return pending;}
 	BOOL IsPending()	{return pending > 0;}
 	BOOL IsCanSend()	{return sndCount <= sndBuffSize;}
-	BOOL IsSmooth()		{return smooth;}
-	void TurnOnSmooth()	{smooth = TRUE;}
+	BOOL Isblock()		{return block;}
+	void TurnOnblock()	{block = TRUE;}
 
-	BOOL TurnOffSmooth()
-	{return ::InterlockedCompareExchange((volatile long*)&smooth, FALSE, TRUE) == TRUE;}
+	BOOL TurnOffblock()
+	{return ::InterlockedCompareExchange((volatile long*)&block, TRUE,FALSE) == FALSE;}
 
 	BOOL ResetSndBuffSize(SOCKET socket)
 	{
@@ -937,9 +937,7 @@ struct TSocketObjBase
 	{
 		connected	= FALSE;
 		valid		= TRUE;
-		smooth		= TRUE;
-		paused		= FALSE;
-		recving		= FALSE;
+		block		= FALSE;
 		pending		= 0;
 		sndCount	= 0;
 		sndBuffSize	= DEF_SNDBUFF_SIZE;
@@ -949,12 +947,17 @@ struct TSocketObjBase
 	}
 };
 
-//准备用于 SocketObj 缓存，但不限于此
-template <class T, class index_type = DWORD, bool adjust_index = false> class CRingCache2
+//准备用于 SocketObj 缓存，但不限于此，onvif业务也可以使用
+class CResultBase
 {
 public:
-
 	enum EnGetResult {GR_FAIL = -1, GR_INVALID = 0, GR_VALID = 1};
+};
+
+template <class T, class index_type = DWORD, bool adjust_index = false> class CRingCache2 :public
+	CResultBase
+{
+public:
 
 	typedef T*									TPTR;
 	typedef volatile T*							VTPTR;

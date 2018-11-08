@@ -93,7 +93,6 @@ SOCKET  COnvifIocp::CreateSocket(TParCreateSocket& ScoketPar)
 	return retSocket;
 }
 
-
 //关闭socket的封装
 int COnvifIocp::ManualCloseSocket(SOCKET sock, int iShutdownFlag, BOOL bGraceful, BOOL bReuseAddress)
 {
@@ -112,6 +111,43 @@ int COnvifIocp::ManualCloseSocket(SOCKET sock, int iShutdownFlag, BOOL bGraceful
 		::shutdown(sock, iShutdownFlag);
 
 	return ::closesocket(sock);
+}
+
+TSocketObj* COnvifIocp::FindSocketobjById(CONNID id)
+{
+	TSocketObj *pSocketobj = nullptr;
+	if(m_bfActiveSocktObj.Get(id, &pSocketobj) !=  CResultBase::GR_VALID)
+	{
+		LOG_ERROR << "BufferFeed Find Socketobj error";
+		pSocketobj = nullptr;
+	}
+	return pSocketobj;
+}
+
+/*
+将需要发送的数据装在buffer中
+返回 已经装入的数据长度。
+返回 -1 为错误。
+*/
+int COnvifIocp::BufferFeed(CONNID id,BYTE *pData,DWORD dwLen)
+{
+	//找到socketobj,buffer
+	TSocketObj *pSocketobj = FindSocketobjById(id);
+	if(pSocketobj == nullptr)
+	{
+		return -1;
+	}
+
+	//保证 onvif 业务顺序进行
+	if(pSocketobj->Isblock())
+	{
+		LOG_ERROR << "Block for send please a wait";
+		return -1;
+	}
+
+	//加入到buffer里
+	pSocketobj->pending += pSocketobj->buffList.Join(pData,dwLen);
+	return pSocketobj->pending;
 }
 
 //准备iocp的资源，私有堆和buffer缓冲区
@@ -159,7 +195,6 @@ void COnvifIocp::CloseConnectSocket(TSocketObj *pSocktObj)
 	return;
 
 }
-
 
 void COnvifIocp::AddToInactiveSocketObj(TSocketObj *pSocktObj)
 {
@@ -368,7 +403,18 @@ void COnvifIocp::DoAcceptState(TBufferObj *pBufferObj,TSocketObj *pSocketObj)
    return;
 }
 
-//server端这个方法不能暴露给上层来直接调用
+//这些不能暴露给上层来直接调用
+/*
+int COnvifIocp::ActionSend(CONNID id)
+{
+	ASSERT(id > 0);
+	TSocketObj *pSocketobj = FindSocketobjById(id);
+	pSocketobj->TurnOnblock();
+	
+	
+	
+}*/
+
 int COnvifIocp::ActionPostRecv(TBufferObj *pBufferObj,TSocketObj *pSocketObj,BOOL bPost)
 {
 	
@@ -549,7 +595,6 @@ void COnvifIocp::EventSwicth(CONNID ptrConnid,TSocketObj *pSocketObj,TBufferObj 
 	return;
 }
 
-
 unsigned int __stdcall COnvifIocp::TaskProc(LPVOID pv)
 {
 	DWORD dwErrorCode = NO_ERROR;
@@ -648,7 +693,6 @@ BOOL COnvifIocp::EventPostAccept(SOCKET hListenFd,ULONG_PTR pBackObj,DWORD dwAcc
 	}
     return TRUE;
 }
-
 
 BOOL COnvifIocp::CreateTaskThreads()
 {

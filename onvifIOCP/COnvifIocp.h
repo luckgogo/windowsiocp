@@ -58,8 +58,6 @@ typedef enum
 */
 #define Action_Continue (int)(1)
 
-
-
 //只支持ipv4，后续需要ipv6的再改造
 typedef struct Onvifiocp_Sockaddr
 {
@@ -83,7 +81,6 @@ typedef struct Onvifiocp_Sockaddr
 		return *this;
 	}
 }OnvifiocpSockaddr,*OnvifiocppSockaddr;
-
 
 typedef ULONG_PTR	CONNID;
 
@@ -132,6 +129,8 @@ public:
     EOnvifIocpError Start();
 	void CloseConnectSocket(TSocketObj *pSocktObj);
 	void AddToInactiveSocketObj(TSocketObj *pSocktObj);
+	int BufferFeed(CONNID id,BYTE *pData,DWORD dwLen);
+
 
 public:
 	BOOL EventPostAccept(SOCKET hListenFd,ULONG_PTR pBackObj,DWORD dwAcceptNum=ONVIFIOCP_DEFAULT_ACCEPT_NUM);
@@ -180,8 +179,9 @@ private:
     CRingPool<TSocketObj> m_bfInactiveSocktObj;
 
 
-	TSocketObj*	COnvifIocp::GetNewSocketObj(CONNID dwConnID, SOCKET soClient);
-	TSocketObj* COnvifIocp::CreateSocketObj();
+	TSocketObj*	GetNewSocketObj(CONNID dwConnID, SOCKET soClient);
+	TSocketObj* CreateSocketObj();
+	TSocketObj* FindSocketobjById(CONNID id);
 private:
 	//windows 扩展函数指针
 	LPFN_ACCEPTEX		m_pfnAcceptEx;
@@ -286,12 +286,14 @@ public:
 template<class T> struct TBufferObjListT : public TSimpleList<T>
 {
 public:
-	int Cat(const BYTE* pData, int length)
+	int Join(const BYTE* pData, int length)
 	{
 		ASSERT(pData != nullptr && length > 0);
 
 		int remain = length;
 
+		//如果以后给非onvif组件使用需要加入一个限制，
+		//防止别人不熟悉而大量消耗buffer.影响性能
 		while(remain > 0)
 		{
 			T* pItem = Back();
@@ -299,12 +301,13 @@ public:
 			if(pItem == nullptr || pItem->IsFull())
 				pItem = PushBack(bfPool.PickFreeItem());
 
-			int cat  = pItem->Cat(pData, remain);
+			int nOK  = pItem->Join(pData, remain);
 
-			pData	+= cat;
-			remain	-= cat;
+			pData	+= nOK;
+			remain	-= nOK;
 		}
 
+		//目前就这样返回
 		return length;
 	}
 
@@ -313,7 +316,7 @@ public:
 		ASSERT(pData != nullptr && length > 0 && length <= (int)bfPool.GetItemCapacity());
 
 		T* pItem = PushBack(bfPool.PickFreeItem());
-		pItem->Cat(pData, length);
+		pItem->Join(pData, length);
 
 		return pItem;
 	}
@@ -340,10 +343,10 @@ struct TSocketObj : public TSocketObjBase
 	OnvifiocpSockaddr	remoteAddr;
 
 	ATL::CStringA	host;
-	TBufferObjListT<TBufferObj>	m_BuffList;
+	TBufferObjListT<TBufferObj> buffList;
 
 	TSocketObj(CNodePoolT<TBufferObj>& bfPool)
-		: m_BuffList(bfPool)
+		: buffList(bfPool)
 	{
 
 	}
@@ -352,7 +355,7 @@ struct TSocketObj : public TSocketObjBase
 	{
 		__super::Release(pSocketObj);
 
-		pSocketObj->m_BuffList.Release();
+		pSocketObj->buffList.Release();
 	}
 
 	void Reset(CONNID dwConnID, SOCKET soClient)
